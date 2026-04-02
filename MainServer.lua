@@ -5,7 +5,6 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 
--- remote event so the GUI reset button can talk to the server
 local resetRemote = Instance.new("RemoteEvent")
 resetRemote.Name = "ResetNPC"
 resetRemote.Parent = ReplicatedStorage
