@@ -11,7 +11,7 @@ resetRemote.Parent = ReplicatedStorage
 
 -- Configuration
 local CONFIG = {
-	DetectionRadius = 40, -- how far the npc can detect a player
+	DetectionRadius = 40,
 	AttackRadius = 5,
 	AttackCooldown = 1.5,
 	AttackDamage = 15,
@@ -19,28 +19,28 @@ local CONFIG = {
 	WanderInterval = 4,
 	FleeHealthThreshold = 30,
 	PatrolPoints = {},
-	MoveSpeed = 16, -- humanoid walkspeed
-	PathUpdateRate = 0.5, -- how often path recalculates in seconds
+	MoveSpeed = 16,
+	PathUpdateRate = 0.5,
 }
 
--- Behavior Tree Node Types
-local NodeResult = { -- enum style table for readable return values
+-- Enum style table
+local NodeResult = {
 	SUCCESS = "SUCCESS",
 	FAILURE = "FAILURE",
 	RUNNING = "RUNNING",
 }
 
 -- NPC Class
-local NPC = {} -- uses metatables for OOP
-NPC.__index = NPC -- redirect index lookups to the NPC table standard OOP pattern
+local NPC = {}
+NPC.__index = NPC
 
-function NPC.new(model) -- constructor takes the NPC Model from Workspace
-	local self = setmetatable({}, NPC) -- create a new table and attach NPC as its metatable
+function NPC.new(model)
+	local self = setmetatable({}, NPC)
 
-	self.Model = model -- reference to the model
-	self.Humanoid = model:FindFirstChildOfClass("Humanoid") -- grab the Humanoid component
-	self.Root = model:FindFirstChild("HumanoidRootPart") -- grab the root part for position math
-	self.SpawnPosition = self.Root.Position -- remember where the NPC started
+	self.Model = model
+	self.Humanoid = model:FindFirstChildOfClass("Humanoid")
+	self.Root = model:FindFirstChild("HumanoidRootPart")
+	self.SpawnPosition = self.Root.Position
 	self.Target = nil
 	self.LastAttackTime = 0
 	self.LastWanderTime = 0
@@ -48,65 +48,77 @@ function NPC.new(model) -- constructor takes the NPC Model from Workspace
 	self.PatrolIndex = 1
 	self.IsAlerted = false
 
-	self.Waypoints = {} -- current computed waypoint list
-	self.WaypointIndex = 1 -- which waypoint we are currently walking toward
-	self.LastPathTime = 0 -- timestamp of last path compute used to throttle recomputes
-	self.PathComputeInProgress = false -- guard prevents two ComputeAsync calls running at once
+	-- Waypoint tracking for the pathfinding system
+	-- WaypointIndex starts at 2 because index 1 is always the NPC's current position
+	-- LastPathTime and PathComputeInProgress together throttle and guard ComputeAsync
+	-- so we never fire two overlapping path requests
+	self.Waypoints = {}
+	self.WaypointIndex = 1
+	self.LastPathTime = 0
+	self.PathComputeInProgress = false
 
-	-- create the StringValue the GUI reads to show current state
+	-- StringValue parented to the model so a Billboard GUI in the character can read
+	-- the current state without needing a remote event
 	local sv = Instance.new("StringValue")
 	sv.Name = "AIState"
 	sv.Value = "Idle"
 	sv.Parent = self.Model
+	self.StateValue = sv
 
-	self.StateValue = sv -- keep a reference so Tick can update it directly
-
-	self.Humanoid.WalkSpeed = CONFIG.MoveSpeed -- apply configured speed
-	self.Humanoid.AutoRotate = true -- let roblox handle turning so we dont fight the physics solver
+	self.Humanoid.WalkSpeed = CONFIG.MoveSpeed
+	-- AutoRotate is left on so Roblox's physics solver handles turning;
+	-- manually rotating every frame while MoveTo is active causes jitter.
+	self.Humanoid.AutoRotate = true
 
 	self.Humanoid.HealthChanged:Connect(function(newHealth)
-		self:OnHealthChanged(newHealth) -- delegate to method below
+		self:OnHealthChanged(newHealth)
 	end)
 
-	return self -- return the instance
+	return self
 end
 
 function NPC:GetHealthPercent()
-	return self.Humanoid.Health / self.Humanoid.MaxHealth -- returns health as a 0 to 1 fraction
+	return self.Humanoid.Health / self.Humanoid.MaxHealth
 end
 
 function NPC:DistanceTo(position)
-	return (self.Root.Position - position).Magnitude -- returns studs between NPC root and a Vector3
+	return (self.Root.Position - position).Magnitude
 end
 
+-- Flattens the direction to the XZ plane before rotating so the NPC never
+-- tilts its body up or down when the target is on a different elevation.
 function NPC:LookAt(position)
-	local direction = (position - self.Root.Position) * Vector3.new(1, 0, 1) -- set Y 0 so NPC doesnt tilt up or down
-	if direction.Magnitude > 0.01 then -- avoid normalising a zero vector
-		self.Root.CFrame = CFrame.new(self.Root.Position, self.Root.Position + direction) -- point face toward target
+	local direction = (position - self.Root.Position) * Vector3.new(1, 0, 1)
+	if direction.Magnitude > 0.01 then -- guard against normalising a zero vector if target is at same position
+		self.Root.CFrame = CFrame.new(self.Root.Position, self.Root.Position + direction)
 	end
 end
 
 function NPC:OnHealthChanged(newHealth)
 	if newHealth <= 0 then
-		self:Cleanup() -- destroy path and disconnect when dead
+		self:Cleanup()
 	end
 end
 
-function NPC:Cleanup() -- called on death removes connections and path
+function NPC:Cleanup()
 	self.Waypoints = {}
 	self.WaypointIndex = 1
 	if self.StateValue then
-		self.StateValue.Value = "Dead" -- update GUI to show dead state
+		self.StateValue.Value = "Dead"
 	end
-	self.Humanoid:UnequipTools() -- drop any held tools
+	self.Humanoid:UnequipTools()
 end
 
-function NPC:ComputePath(targetPos) -- calculates a new path toward a position
-	if self.PathComputeInProgress then return end -- block reentry so two computes dont run at the same time
+-- Throttled via PathUpdateRate and guarded by PathComputeInProgress to prevent
+-- overlapping ComputeAsync calls, which can cause the path to silently fail or
+-- return stale results. Falls back to a direct MoveTo if pathfinding fails so
+-- the NPC never just stands still.
+function NPC:ComputePath(targetPos)
+	if self.PathComputeInProgress then return end
 	if self.Humanoid.Health <= 0 then return end
 
 	local now = tick()
-	if now - self.LastPathTime < CONFIG.PathUpdateRate then return end -- throttle so we dont recompute every tick
+	if now - self.LastPathTime < CONFIG.PathUpdateRate then return end -- don't recompute until interval has passed
 	self.LastPathTime = now
 
 	self.PathComputeInProgress = true
@@ -120,100 +132,106 @@ function NPC:ComputePath(targetPos) -- calculates a new path toward a position
 	})
 
 	local success = pcall(function()
-		path:ComputeAsync(self.Root.Position, targetPos) -- compute from current pos to target
+		path:ComputeAsync(self.Root.Position, targetPos)
 	end)
 
 	if success and path.Status == Enum.PathStatus.Success then
-		self.Waypoints = path:GetWaypoints() -- store the full waypoint list
-		self.WaypointIndex = 2 -- skip index 1 since its the NPCs current position
-		self:FollowPath() -- immediately issue the first MoveTo so there is no delay
+		self.Waypoints = path:GetWaypoints()
+		self.WaypointIndex = 2 -- index 1 is the NPC's current position, skip it
+		self:FollowPath()
 	else
 		self.Waypoints = {}
-		self.Humanoid:MoveTo(targetPos) -- fallback to direct move if pathfinding fails
+		self.Humanoid:MoveTo(targetPos) -- direct move fallback if pathfinding fails
 	end
 
 	self.PathComputeInProgress = false
 end
 
-function NPC:FollowPath() -- issues MoveTo for the current waypoint in the list
+function NPC:FollowPath()
 	if #self.Waypoints == 0 then return end
 	if self.WaypointIndex > #self.Waypoints then return end
 
 	local waypoint = self.Waypoints[self.WaypointIndex]
 
+	-- Jump must be triggered before issuing MoveTo, otherwise the humanoid
+	-- starts walking into the obstacle before the jump animation fires.
 	if waypoint.Action == Enum.PathWaypointAction.Jump then
-		self.Humanoid.Jump = true -- trigger jump before issuing MoveTo so the jump fires at the right spot
+		self.Humanoid.Jump = true
 	end
 
-	self.Humanoid:MoveTo(waypoint.Position) -- non blocking move toward the current waypoint
+	self.Humanoid:MoveTo(waypoint.Position)
 end
 
-function NPC:AdvanceWaypoints() -- checks distance to current waypoint and steps forward if close enough
+-- Uses horizontal-only distance so that sloped terrain or stairs don't inflate
+-- the measured distance and cause the NPC to skip waypoints early.
+function NPC:AdvanceWaypoints()
 	if #self.Waypoints == 0 then return end
 	if self.WaypointIndex > #self.Waypoints then return end
 
 	local waypoint = self.Waypoints[self.WaypointIndex]
-	local horizontalSelf = Vector3.new(self.Root.Position.X, 0, self.Root.Position.Z) -- flatten Y so slopes dont inflate distance
+	local horizontalSelf = Vector3.new(self.Root.Position.X, 0, self.Root.Position.Z) -- strip Y so slope doesn't inflate distance
 	local horizontalWaypoint = Vector3.new(waypoint.Position.X, 0, waypoint.Position.Z)
-	local dist = (horizontalSelf - horizontalWaypoint).Magnitude
 
-	if dist < 4 then -- within 4 studs counts as reached so movement stays fluid
+	if (horizontalSelf - horizontalWaypoint).Magnitude < 4 then -- 4 stud threshold keeps movement fluid without overshooting
 		self.WaypointIndex = self.WaypointIndex + 1
-		self:FollowPath() -- immediately issue next MoveTo so there is no pause between waypoints
+		self:FollowPath()
 	end
 end
 
-function NPC:MoveToward(targetPos) -- called every tick to keep path fresh and advance waypoints
-	self:ComputePath(targetPos) -- throttled internally so safe to call every tick
-	self:AdvanceWaypoints() -- check if we passed the current waypoint and step forward
+function NPC:MoveToward(targetPos)
+	self:ComputePath(targetPos)
+	self:AdvanceWaypoints()
 end
 
-function NPC:FindNearestPlayer() -- scans all players and returns the closest one in range
+function NPC:FindNearestPlayer()
 	local nearest = nil
-	local nearestDist = CONFIG.DetectionRadius -- only consider players within detection radius
+	local nearestDist = CONFIG.DetectionRadius
 
-	for _, player in ipairs(Players:GetPlayers()) do -- iterate every connected player
+	for _, player in ipairs(Players:GetPlayers()) do
 		local char = player.Character
 		if char then
 			local root = char:FindFirstChild("HumanoidRootPart")
 			local hum = char:FindFirstChildOfClass("Humanoid")
-			if root and hum and hum.Health > 0 then -- only target alive players with a root
-				local dist = self:DistanceTo(root.Position) -- measure distance
-				if dist < nearestDist then -- checks if closer than current best
+			if root and hum and hum.Health > 0 then
+				local dist = self:DistanceTo(root.Position)
+				if dist < nearestDist then
 					nearestDist = dist
-					nearest = player -- update nearest
+					nearest = player
 				end
 			end
 		end
 	end
 
-	return nearest -- returns Player or nil
+	return nearest
 end
 
-function NPC:HasLineOfSight(targetRoot) -- raycasts from NPC eyes toward the target
-	local origin = self.Root.Position + Vector3.new(0, 2, 0) -- offset up slightly for eye height
-	local direction = (targetRoot.Position - origin) -- vector pointing at the target
+-- Casts from slightly above the root to simulate eye height. The NPC model is
+-- excluded from the filter so its own parts don't immediately block the ray.
+function NPC:HasLineOfSight(targetRoot)
+	local origin = self.Root.Position + Vector3.new(0, 2, 0) -- offset to eye height so ground geometry doesn't block the ray
+	local direction = targetRoot.Position - origin
 
 	local rayParams = RaycastParams.new()
-	rayParams.FilterDescendantsInstances = {self.Model} -- ignore the NPCs own parts
+	rayParams.FilterDescendantsInstances = {self.Model} -- exclude self or the ray hits the NPC's own parts instantly
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
-	local result = workspace:Raycast(origin, direction, rayParams) -- fire the ray
+	local result = workspace:Raycast(origin, direction, rayParams)
 
 	if result then
-		-- if the ray hits the target character LOS is clear
-		return result.Instance:IsDescendantOf(targetRoot.Parent)
+		return result.Instance:IsDescendantOf(targetRoot.Parent) -- true only if the ray landed on the target's character
 	end
 
-	return false -- ray hit something else LOS blocked
+	return false
 end
 
 -- Behavior Tree Nodes
--- each function checks a condition or performs an action returning a NodeResult
+-- SUCCESS FAILURE RUNNING follows standard BT conventions:
+-- SUCCESS = condition met or action completed, FAILURE = condition not met,
+-- RUNNING = action is ongoing and should be revisited next tick.
 
 function NPC:BT_IsDead()
 	if self.Humanoid.Health <= 0 then
-		return NodeResult.SUCCESS -- success means dead
+		return NodeResult.SUCCESS
 	end
 	return NodeResult.FAILURE
 end
@@ -225,31 +243,31 @@ function NPC:BT_ShouldFlee()
 	return NodeResult.FAILURE
 end
 
-function NPC:BT_FindTarget() -- scan for a nearby player and store as self.Target
+function NPC:BT_FindTarget()
 	local player = self:FindNearestPlayer()
 	if player and player.Character then
 		local targetRoot = player.Character:FindFirstChild("HumanoidRootPart")
-		if targetRoot and self:HasLineOfSight(targetRoot) then -- only target if LOS is clear
-			self.Target = player -- store target on the NPC instance
-			self.IsAlerted = true -- mark as alerted so patrol doesnt resume immediately
+		if targetRoot and self:HasLineOfSight(targetRoot) then -- only lock on if LOS is clear, prevents targeting through walls
+			self.Target = player
+			self.IsAlerted = true
 			return NodeResult.SUCCESS
 		end
 	end
-	self.Target = nil -- no valid target found clear it
+	self.Target = nil -- clear stale target if no valid player was found this tick
 	return NodeResult.FAILURE
 end
 
 function NPC:BT_FleeFromTarget()
 	if not self.Target or not self.Target.Character then
-		return NodeResult.FAILURE -- no target to flee from
+		return NodeResult.FAILURE
 	end
 
 	local targetPos = self.Target.Character.HumanoidRootPart.Position
-	local awayDir = (self.Root.Position - targetPos).Unit -- vector pointing away from target
-	local fleePos = self.Root.Position + awayDir * 30 -- flee 30 studs in that direction
+	local awayDir = (self.Root.Position - targetPos).Unit -- unit vector pointing directly away from the threat
+	local fleePos = self.Root.Position + awayDir * 30
 
-	self:MoveToward(fleePos) -- smooth path away from target
-	return NodeResult.RUNNING -- still fleeing
+	self:MoveToward(fleePos)
+	return NodeResult.RUNNING
 end
 
 function NPC:BT_ChaseTarget()
@@ -260,14 +278,12 @@ function NPC:BT_ChaseTarget()
 	local targetRoot = self.Target.Character:FindFirstChild("HumanoidRootPart")
 	if not targetRoot then return NodeResult.FAILURE end
 
-	local dist = self:DistanceTo(targetRoot.Position)
-
-	if dist <= CONFIG.AttackRadius then -- close enough to attack dont need to chase
-		return NodeResult.SUCCESS -- signal to attack node that were in range
+	if self:DistanceTo(targetRoot.Position) <= CONFIG.AttackRadius then
+		return NodeResult.SUCCESS -- in range signal attack node to take over
 	end
 
-	self:MoveToward(targetRoot.Position) -- smooth continuous path toward target
-	return NodeResult.RUNNING -- still chasing
+	self:MoveToward(targetRoot.Position)
+	return NodeResult.RUNNING
 end
 
 function NPC:BT_AttackTarget()
@@ -279,28 +295,25 @@ function NPC:BT_AttackTarget()
 	local targetHum = self.Target.Character:FindFirstChildOfClass("Humanoid")
 
 	if not targetRoot or not targetHum then return NodeResult.FAILURE end
+	if self:DistanceTo(targetRoot.Position) > CONFIG.AttackRadius then return NodeResult.FAILURE end -- target escaped fall back to chase
 
-	local dist = self:DistanceTo(targetRoot.Position) -- recheck range every tick
-
-	if dist > CONFIG.AttackRadius then -- target moved out of range
-		return NodeResult.FAILURE -- fall back to chase
+	local now = tick()
+	if now - self.LastAttackTime < CONFIG.AttackCooldown then
+		return NodeResult.RUNNING -- cooldown still active hold until ready
 	end
 
-	local now = tick() -- current timestamp in seconds
-	if now - self.LastAttackTime < CONFIG.AttackCooldown then -- cooldown not finished yet
-		return NodeResult.RUNNING -- waiting to attack again
-	end
+	self.LastAttackTime = now
+	targetHum:TakeDamage(CONFIG.AttackDamage)
+	self:LookAt(targetRoot.Position)
 
-	self.LastAttackTime = now -- reset cooldown timer
-	targetHum:TakeDamage(CONFIG.AttackDamage) -- apply damage to the targets Humanoid
-	self:LookAt(targetRoot.Position) -- snap face toward target on attack
-
-	-- visual punch effect briefly offset the NPC toward the target using CFrame
+	-- Brief CFrame lunge toward the target to sell the hit visually
+	-- Resets after 0.1s the Parent check guards against the NPC being
+	-- destroyed during the delay.
 	local punchOffset = CFrame.new(self.Root.Position, targetRoot.Position) * CFrame.new(0, 0, -1.5)
-	self.Root.CFrame = punchOffset -- lunge forward
-	task.delay(0.1, function() -- reset after 0.1s
+	self.Root.CFrame = punchOffset
+	task.delay(0.1, function()
 		if self.Root and self.Root.Parent then
-			self.Root.CFrame = CFrame.new(self.Root.Position) -- snap back
+			self.Root.CFrame = CFrame.new(self.Root.Position)
 		end
 	end)
 
@@ -309,43 +322,45 @@ end
 
 function NPC:BT_Patrol()
 	local points = CONFIG.PatrolPoints
-	if #points == 0 then -- no patrol points configured skip to wander
-		return NodeResult.FAILURE
-	end
+	if #points == 0 then return NodeResult.FAILURE end
 
-	local target = points[self.PatrolIndex] -- get the current patrol waypoint part
-	local dist = self:DistanceTo(target.Position)
+	local target = points[self.PatrolIndex]
 
-	if dist < 3 then -- close enough to count as reached
-		self.PatrolIndex = (self.PatrolIndex % #points) + 1 -- advance to next point loop at end
-		self.Waypoints = {} -- clear stale waypoints so we dont keep walking toward the old point
+	if self:DistanceTo(target.Position) < 3 then
+		self.PatrolIndex = (self.PatrolIndex % #points) + 1 -- advance and loop back to 1 after the last point
+		-- Clear path state so the next point triggers a fresh ComputeAsync
+		-- rather than continuing along the old route.
+		self.Waypoints = {}
 		self.WaypointIndex = 1
-		self.LastPathTime = 0 -- reset throttle so next point gets a fresh path immediately
+		self.LastPathTime = 0
 		return NodeResult.RUNNING
 	end
 
-	self:MoveToward(target.Position) -- smooth path toward patrol point
+	self:MoveToward(target.Position)
 	return NodeResult.RUNNING
 end
 
 function NPC:BT_Wander()
 	local now = tick()
 
+	-- Pick a new random destination when the previous one was reached or the
+	-- interval has elapsed. Polar coordinates keep the target within WanderRadius
+	-- of the spawn rather than drifting arbitrarily far from it.
 	if not self.WanderTarget or (now - self.LastWanderTime) > CONFIG.WanderInterval then
-		-- pick random polar offset within WanderRadius
-		local angle = math.random() * 2 * math.pi -- random angle in radians
-		local radius = math.random(5, CONFIG.WanderRadius) -- random distance from spawn
-		local offsetX = math.cos(angle) * radius -- X component of offset
-		local offsetZ = math.sin(angle) * radius -- Z component of offset
-		self.WanderTarget = self.SpawnPosition + Vector3.new(offsetX, 0, offsetZ) -- new wander goal
+		local angle = math.random() * 2 * math.pi
+		local radius = math.random(5, CONFIG.WanderRadius)
+		self.WanderTarget = self.SpawnPosition + Vector3.new(
+			math.cos(angle) * radius,
+			0,
+			math.sin(angle) * radius
+		)
 		self.LastWanderTime = now
-		self.Waypoints = {} -- clear old path so the new destination gets a fresh compute
+		self.Waypoints = {}
 		self.WaypointIndex = 1
-		self.LastPathTime = 0 -- force immediate recompute toward the new wander spot
+		self.LastPathTime = 0 -- force immediate recompute toward the new wander destination
 	end
 
-	local dist = self:DistanceTo(self.WanderTarget)
-	if dist < 3 then -- reached the wander target
+	if self:DistanceTo(self.WanderTarget) < 3 then
 		self.WanderTarget = nil
 		self.Waypoints = {}
 		self.WaypointIndex = 1
@@ -353,10 +368,12 @@ function NPC:BT_Wander()
 		return NodeResult.SUCCESS
 	end
 
-	self:MoveToward(self.WanderTarget) -- smooth path toward wander point
+	self:MoveToward(self.WanderTarget)
 	return NodeResult.RUNNING
 end
 
+-- Runs every tickInterval seconds. Evaluates the behavior tree top-down so that
+-- higher-priority branches (flee, attack) always override lower ones (patrol, wander).
 function NPC:Tick()
 	if self.StateValue then
 		if self.Humanoid.Health <= 0 then
@@ -366,10 +383,10 @@ function NPC:Tick()
 		elseif self.Target then
 			local targetRoot = self.Target.Character and self.Target.Character:FindFirstChild("HumanoidRootPart")
 			if targetRoot and self:DistanceTo(targetRoot.Position) <= CONFIG.AttackRadius then
-				self.StateValue.Value = "Attacking" -- in attack range so show attacking
+				self.StateValue.Value = "Attacking"
 			else
-				self.StateValue.Value = "Chasing" -- has target but not close enough yet
-			end -- closes the if targetRoot block
+				self.StateValue.Value = "Chasing"
+			end
 		elseif #CONFIG.PatrolPoints > 0 then
 			self.StateValue.Value = "Patrol"
 		else
@@ -377,45 +394,45 @@ function NPC:Tick()
 		end
 	end
 
-	if self:BT_IsDead() == NodeResult.SUCCESS then return end -- dead do nothing
+	if self:BT_IsDead() == NodeResult.SUCCESS then return end
 
-	-- PRIORITY 1 flee if low health and a target exists
+	-- PRIORITY 1: flee overrides everything when health is critical
 	if self:BT_ShouldFlee() == NodeResult.SUCCESS then
-		if self:BT_FindTarget() == NodeResult.SUCCESS then -- only flee if theres something to flee from
+		if self:BT_FindTarget() == NodeResult.SUCCESS then
 			self:BT_FleeFromTarget()
 			return
 		end
 	end
 
-	-- PRIORITY 2 attack or chase if a target is found
+	-- PRIORITY 2: chase then attack if a target is in range and visible
 	if self:BT_FindTarget() == NodeResult.SUCCESS then
-		local chaseResult = self:BT_ChaseTarget() -- move toward target
-		if chaseResult == NodeResult.SUCCESS then -- in attack range
-			self:BT_AttackTarget() -- deal damage
+		local chaseResult = self:BT_ChaseTarget()
+		if chaseResult == NodeResult.SUCCESS then -- chase returned SUCCESS meaning we're in attack range
+			self:BT_AttackTarget()
 		end
-		return -- either chasing or attacking skip lower priority branches
+		return
 	end
 
-	-- PRIORITY 3 patrol if patrol points exist
+	-- PRIORITY 3: structured patrol if points are configured
 	if #CONFIG.PatrolPoints > 0 then
 		self:BT_Patrol()
 		return
 	end
 
-	-- PRIORITY 4 wander as lowest priority fallback
+	-- PRIORITY 4: wander as lowest priority fallback when nothing else applies
 	self:BT_Wander()
 end
--- collect patrol points from workspace folder
+
+-- Patrol point collection
 local patrolFolder = workspace:FindFirstChild("PatrolPoints")
 if patrolFolder then
-	for _, part in ipairs(patrolFolder:GetChildren()) do -- collect every part in the folder
+	for _, part in ipairs(patrolFolder:GetChildren()) do
 		if part:IsA("BasePart") then
-			table.insert(CONFIG.PatrolPoints, part) -- add to patrol list
+			table.insert(CONFIG.PatrolPoints, part)
 		end
 	end
 end
 
--- holds the active npc instance so reset can replace it
 local npc
 
 local function spawnNPC()
@@ -425,37 +442,36 @@ local function spawnNPC()
 		return
 	end
 
-	-- remove existing npc if one is already in the world
 	local existing = workspace:FindFirstChild("NPC")
 	if existing then
 		existing:Destroy()
 	end
 
-	local model = template:Clone() -- clone from ServerStorage so the original stays clean
+	local model = template:Clone()
 	model.Name = "NPC"
 	model.Parent = workspace
 
-	npc = NPC.new(model) -- create a fresh NPC instance from the new model
+	npc = NPC.new(model)
 end
 
--- initial spawn
 spawnNPC()
 
--- reset button handler clones a new NPC from ServerStorage
 resetRemote.OnServerEvent:Connect(function()
-	spawnNPC() -- destroy old and spawn fresh on every reset request
+	spawnNPC()
 end)
 
-local tickInterval = 0.1 -- seconds between AI ticks so pathfinding isnt hammered every frame
-local timeSinceLastTick = 0 -- accumulator
+-- Heartbeat accumulator pattern keeps the AI tick rate decoupled from the
+-- frame rate 0.1s per tick is frequent enough for responsive decisions
+-- without firing pathfinding every frame
+local tickInterval = 0.1
+local timeSinceLastTick = 0
 
--- Fires every frame
 RunService.Heartbeat:Connect(function(deltaTime)
-	timeSinceLastTick = timeSinceLastTick + deltaTime -- accumulate elapsed time
+	timeSinceLastTick = timeSinceLastTick + deltaTime
 	if timeSinceLastTick >= tickInterval then
-		timeSinceLastTick = 0 -- reset accumulator
+		timeSinceLastTick = 0 -- reset accumulator after each tick fires
 		if npc then
-			npc:Tick() -- run 1 AI decision cycle
+			npc:Tick()
 		end
 	end
 end)
